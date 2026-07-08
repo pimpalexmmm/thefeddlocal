@@ -1,0 +1,23 @@
+# thefeed-server — slim Docker image for free platforms (Fly.io, Railway, etc.)
+# Uses the pre-built binary from files/ to skip the Go build stage.
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata
+
+COPY files/thefeed-server-linux-amd64 /usr/local/bin/thefeed-server
+RUN chmod 755 /usr/local/bin/thefeed-server
+
+RUN mkdir -p /data && chmod 755 /data
+
+COPY scripts/docker-entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
+
+# Fly.io maps external 53 → internal 5300; the entrypoint listens on 5300.
+# Override with -e THEFEED_LISTEN=:53 when running on a VPS with privileged port.
+EXPOSE 5300/udp
+
+ENV THEFEED_DATA_DIR=/data
+ENV THEFEED_NO_TELEGRAM=1
+
+ENTRYPOINT ["/entrypoint.sh"]

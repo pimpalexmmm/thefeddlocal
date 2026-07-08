@@ -1,0 +1,47 @@
+# fly.toml — thefeed-server on Fly.io
+#
+# Architecture:
+#   Fly.io anycast IP (port 53/udp) → internal port 5300 → thefeed-server
+#
+# Prerequisites:
+#   flyctl (https://fly.io/docs/hands-on/install-flyctl/)
+#
+# Quick start:
+#   fly launch --copy-config --no-deploy --name thefeed-$(echo $DOMAIN | tr '.' '-')
+#   fly secrets set THEFEED_DOMAIN=t.example.com THEFEED_KEY=your-key
+#   fly volumes create thefeed_data --region ams --size 1
+#   fly deploy
+#
+# Full script:
+#   THEFEED_DOMAIN=t.example.com THEFEED_KEY=your-key bash scripts/deploy-fly.sh
+
+# app name will be set by the Fly.io dashboard when you connect the GitHub repo.
+# Remove the comment on the line below if you want to hardcode it:
+# app = "thefeed-server"
+
+primary_region = "ams"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile.free"
+
+[mounts]
+  source = "thefeed_data"
+  destination = "/data"
+
+# Only DNS/UDP traffic. The server has no HTTP/health endpoint.
+[[services]]
+  protocol = "udp"
+  internal_port = 5300
+
+  [[services.ports]]
+    port = 53
+
+  [[services.ports]]
+    port = 5300
+
+  [services.concurrency]
+    hard_limit = 100
+    soft_limit = 50
+    type = "connections"
