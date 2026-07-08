@@ -1,0 +1,389 @@
+package server
+
+import (
+	"strings"
+	"testing"
+
+	"golang.org/x/net/html"
+
+	"github.com/sartoopjj/thefeed/internal/protocol"
+)
+
+func TestParsePublicMessages(t *testing.T) {
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/101">
+			<a class="tgme_widget_message_date"><time datetime="2026-03-30T04:45:00+00:00"></time></a>
+			<div class="tgme_widget_message_text">hello<br/>world</div>
+		</div>
+		<div class="tgme_widget_message" data-post="testchan/105">
+			<a class="tgme_widget_message_date"><time datetime="2026-03-30T04:50:00+00:00"></time></a>
+			<div class="tgme_widget_message_photo_wrap"></div>
+		</div>
+		<div class="tgme_widget_message" data-post="testchan/106">
+			<a class="tgme_widget_message_date"><time datetime="2026-03-30T04:51:00+00:00"></time></a>
+			<a class="tgme_widget_message_photo_wrap" href="https://t.me/testchan/106"></a>
+			<div class="tgme_widget_message_text">photo caption</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("len(msgs) = %d, want 3", len(msgs))
+	}
+	// Photo with caption (newest first)
+	if msgs[0].ID != 106 {
+		t.Fatalf("msgs[0].ID = %d, want 106", msgs[0].ID)
+	}
+	want := protocol.MediaImage + "\n" + "photo caption"
+	if msgs[0].Text != want {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, want)
+	}
+	// Photo only
+	if msgs[1].ID != 105 {
+		t.Fatalf("msgs[1].ID = %d, want 105", msgs[1].ID)
+	}
+	if msgs[1].Text != protocol.MediaImage {
+		t.Fatalf("msgs[1].Text = %q, want %q", msgs[1].Text, protocol.MediaImage)
+	}
+	// Text only
+	if msgs[2].ID != 101 {
+		t.Fatalf("msgs[2].ID = %d, want 101", msgs[2].ID)
+	}
+	if msgs[2].Text != "hello\nworld" {
+		t.Fatalf("msgs[2].Text = %q, want %q", msgs[2].Text, "hello\nworld")
+	}
+}
+
+func TestParsePublicMessagesNoLimit(t *testing.T) {
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/1"><div class="tgme_widget_message_text">one</div></div>
+		<div class="tgme_widget_message" data-post="testchan/2"><div class="tgme_widget_message_text">two</div></div>
+		<div class="tgme_widget_message" data-post="testchan/3"><div class="tgme_widget_message_text">three</div></div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 3 {
+		t.Fatalf("len(msgs) = %d, want 3", len(msgs))
+	}
+	if msgs[0].ID != 3 || msgs[1].ID != 2 || msgs[2].ID != 1 {
+		t.Fatalf("got ids %d,%d,%d want 3,2,1", msgs[0].ID, msgs[1].ID, msgs[2].ID)
+	}
+}
+
+func TestMergeMessages(t *testing.T) {
+	old := []protocol.Message{
+		{ID: 100, Timestamp: 1000, Text: "old100"},
+		{ID: 99, Timestamp: 999, Text: "old99"},
+	}
+	newMsgs := []protocol.Message{
+		{ID: 101, Timestamp: 1001, Text: "new101"},
+		{ID: 100, Timestamp: 1000, Text: "edited100"},
+	}
+	merged := mergeMessages(old, newMsgs)
+	if len(merged) != 3 {
+		t.Fatalf("len(merged) = %d, want 3", len(merged))
+	}
+	if merged[0].ID != 101 {
+		t.Fatalf("merged[0].ID = %d, want 101", merged[0].ID)
+	}
+	if merged[1].Text != "edited100" {
+		t.Fatalf("merged[1].Text = %q, want edited100", merged[1].Text)
+	}
+	if merged[2].ID != 99 {
+		t.Fatalf("merged[2].ID = %d, want 99", merged[2].ID)
+	}
+}
+
+func TestParsePublicMessagesAlbumStacksHeaders(t *testing.T) {
+	// Album = one data-post with N nested photo wraps. We must emit N
+	// stacked [IMAGE] headers so albumSpan suppresses the absorbed-sibling
+	// "1 missed" gap.
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/210">
+			<a class="tgme_widget_message_date"><time datetime="2026-04-10T12:00:00+00:00"></time></a>
+			<a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn.telegram.org/img1.jpg')"></a>
+			<a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn.telegram.org/img2.jpg')"></a>
+			<a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn.telegram.org/img3.jpg')"></a>
+			<div class="tgme_widget_message_text">album caption</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, sources, err := parsePublicMessagesWithMedia(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessagesWithMedia: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	wantText := "[IMAGE]\n[IMAGE]\n[IMAGE]\nalbum caption"
+	if msgs[0].Text != wantText {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, wantText)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("len(sources) = %d, want 1", len(sources))
+	}
+	src := sources[0]
+	if src.tag != protocol.MediaImage {
+		t.Errorf("src.tag = %q, want %q", src.tag, protocol.MediaImage)
+	}
+	if src.url != "https://cdn.telegram.org/img1.jpg" {
+		t.Errorf("src.url = %q, want first photo URL", src.url)
+	}
+	if len(src.extraURLs) != 2 ||
+		src.extraURLs[0] != "https://cdn.telegram.org/img2.jpg" ||
+		src.extraURLs[1] != "https://cdn.telegram.org/img3.jpg" {
+		t.Errorf("src.extraURLs = %v, want [img2, img3]", src.extraURLs)
+	}
+}
+
+func TestParsePublicMessagesSinglePhotoUnchanged(t *testing.T) {
+	// Single photo: one [IMAGE] header, no extraURLs.
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/220">
+			<a class="tgme_widget_message_photo_wrap" style="background-image:url('https://cdn.telegram.org/single.jpg')"></a>
+			<div class="tgme_widget_message_text">just one</div>
+		</div>
+		</body></html>
+	`)
+	msgs, sources, err := parsePublicMessagesWithMedia(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessagesWithMedia: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	wantText := "[IMAGE]\njust one"
+	if msgs[0].Text != wantText {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, wantText)
+	}
+	if sources[0].url != "https://cdn.telegram.org/single.jpg" || len(sources[0].extraURLs) != 0 {
+		t.Errorf("source = %+v, want url=single, extraURLs empty", sources[0])
+	}
+}
+
+func TestParsePublicMessagesReplyPreviewUsesMainBody(t *testing.T) {
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/201">
+			<div class="tgme_widget_message_reply">
+				<div class="tgme_widget_message_text">old replied message preview</div>
+			</div>
+			<div class="tgme_widget_message_text">this is the real new post</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	if msgs[0].Text != "[REPLY]\nthis is the real new post" {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, "[REPLY]\nthis is the real new post")
+	}
+}
+
+func TestParsePublicMessagesReplyWithID(t *testing.T) {
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/305">
+			<a class="tgme_widget_message_date"><time datetime="2026-04-10T12:00:00+00:00"></time></a>
+			<a class="tgme_widget_message_reply" href="https://t.me/testchan/300">
+				<div class="tgme_widget_message_text">original post</div>
+			</a>
+			<div class="tgme_widget_message_text">my reply text</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	want := "[REPLY]:300\nmy reply text"
+	if msgs[0].Text != want {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, want)
+	}
+}
+
+func TestParsePublicMessagesPoll(t *testing.T) {
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/400">
+			<a class="tgme_widget_message_date"><time datetime="2026-04-10T12:00:00+00:00"></time></a>
+			<div class="tgme_widget_message_poll">
+				<div class="tgme_widget_message_poll_question">What is your favorite color?</div>
+				<div class="tgme_widget_message_poll_option">
+					<div class="tgme_widget_message_poll_option_text">Red</div>
+				</div>
+				<div class="tgme_widget_message_poll_option">
+					<div class="tgme_widget_message_poll_option_text">Blue</div>
+				</div>
+				<div class="tgme_widget_message_poll_option">
+					<div class="tgme_widget_message_poll_option_text">Green</div>
+				</div>
+			</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	want := "[POLL]\n📊 What is your favorite color?\n○ Red\n○ Blue\n○ Green"
+	if msgs[0].Text != want {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, want)
+	}
+}
+
+func TestExtractMessageTextPreservesLinks(t *testing.T) {
+	htmlStr := `<div class="tgme_widget_message_text">Check out <a href="https://example.com">this link</a> for details</div>`
+	doc, err := html.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		t.Fatalf("html.Parse: %v", err)
+	}
+	node := findFirstByClass(doc, "tgme_widget_message_text")
+	text := extractMessageText(node)
+	want := "Check out [this link](https://example.com) for details"
+	if text != want {
+		t.Fatalf("extractMessageText = %q, want %q", text, want)
+	}
+}
+
+func TestExtractMessageTextBareURL(t *testing.T) {
+	htmlStr := `<div class="tgme_widget_message_text">Visit <a href="https://example.com">https://example.com</a> now</div>`
+	doc, err := html.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		t.Fatalf("html.Parse: %v", err)
+	}
+	node := findFirstByClass(doc, "tgme_widget_message_text")
+	text := extractMessageText(node)
+	want := "Visit https://example.com now"
+	if text != want {
+		t.Fatalf("extractMessageText = %q, want %q", text, want)
+	}
+}
+
+func TestExtractMessageTextRejectsJavascriptURL(t *testing.T) {
+	htmlStr := `<div class="tgme_widget_message_text"><a href="javascript:alert(1)">click me</a></div>`
+	doc, err := html.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		t.Fatalf("html.Parse: %v", err)
+	}
+	node := findFirstByClass(doc, "tgme_widget_message_text")
+	text := extractMessageText(node)
+	// javascript: URLs should be stripped — only text remains
+	want := "click me"
+	if text != want {
+		t.Fatalf("extractMessageText = %q, want %q", text, want)
+	}
+}
+
+func TestExtractMessageTextRejectsDataURL(t *testing.T) {
+	htmlStr := `<div class="tgme_widget_message_text"><a href="data:text/html,<script>alert(1)</script>">link</a></div>`
+	doc, err := html.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		t.Fatalf("html.Parse: %v", err)
+	}
+	node := findFirstByClass(doc, "tgme_widget_message_text")
+	text := extractMessageText(node)
+	// data: URLs should be stripped — only text remains
+	want := "link"
+	if text != want {
+		t.Fatalf("extractMessageText = %q, want %q", text, want)
+	}
+}
+
+func TestParsePublicMessagesUnsupportedMedia(t *testing.T) {
+	// Real Telegram HTML for polls/quizzes in public view: no poll widget,
+	// just a "message_media_not_supported" div, and no message body text.
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="testchan/181">
+			<a class="tgme_widget_message_date"><time datetime="2026-05-01T10:00:00+00:00"></time></a>
+			<div class="message_media_not_supported_wrap">
+				<div class="message_media_not_supported">
+					<div class="message_media_not_supported_label">Please open Telegram to view this post</div>
+					<a href="https://t.me/testchan/181" class="message_media_view_in_telegram">VIEW IN TELEGRAM</a>
+				</div>
+			</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	if msgs[0].ID != 181 {
+		t.Fatalf("msgs[0].ID = %d, want 181", msgs[0].ID)
+	}
+	if msgs[0].Text != protocol.MediaPoll {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, protocol.MediaPoll)
+	}
+}
+
+// Regression test for https://t.me/networkti/239 — a normal text post that
+// also contains Telegram Premium custom emojis was being mis-tagged as a
+// [POLL] because Telegram's public web view emits a
+// "message_media_not_supported" element for premium emojis it can't render.
+// We must NOT prefix such messages with [POLL] when there is real body text.
+func TestParsePublicMessagesPremiumEmojiNotPoll(t *testing.T) {
+	body := []byte(`
+		<html><body>
+		<div class="tgme_widget_message" data-post="networkti/239">
+			<a class="tgme_widget_message_date"><time datetime="2026-04-20T10:00:00+00:00"></time></a>
+			<div class="tgme_widget_message_text">salam this is a normal post with premium emoji</div>
+			<div class="message_media_not_supported_wrap">
+				<div class="message_media_not_supported">
+					<div class="message_media_not_supported_label">Please open Telegram to view this post</div>
+					<a href="https://t.me/networkti/239" class="message_media_view_in_telegram">VIEW IN TELEGRAM</a>
+				</div>
+			</div>
+		</div>
+		</body></html>
+	`)
+
+	msgs, err := parsePublicMessages(body)
+	if err != nil {
+		t.Fatalf("parsePublicMessages: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	if msgs[0].ID != 239 {
+		t.Fatalf("msgs[0].ID = %d, want 239", msgs[0].ID)
+	}
+	if strings.Contains(msgs[0].Text, protocol.MediaPoll) {
+		t.Fatalf("premium-emoji message tagged as poll: %q", msgs[0].Text)
+	}
+	want := "salam this is a normal post with premium emoji"
+	if msgs[0].Text != want {
+		t.Fatalf("msgs[0].Text = %q, want %q", msgs[0].Text, want)
+	}
+}
